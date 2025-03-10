@@ -1,0 +1,151 @@
+################################################################################
+#' @description Generates a series of risk-neutral asset prices under stdNTS 
+#' with *constant* beta,gamma, and a GARCH(1,1)-type sigma path. This is 
+#' analogous to your existing dynamic code but without B(t).
+#' @param alpha Alpha parameter of stdNTS distribution.
+#' @param theta Theta parameter of stdNTS distribution.
+#' @param beta Constant beta parameter for stdNTS.
+#' @param gamma Constant gamma parameter for stdNTS.
+#' @param kappa GARCH(1,1) parameter.
+#' @param xi    GARCH(1,1) parameter.
+#' @param lambda GARCH(1,1) parameter (constant).
+#' @param zeta  GARCH(1,1) parameter.
+#' @param sigma0 Initial value for sigma in GARCH(1,1).
+#' @param S0  Initial asset price.
+#' @param y0  Initial log-return (default 0).
+#' @param npath Number of simulation paths.
+#' @param ntimestep Number of timesteps.
+#' @param dt  Time step size in years (default 1/250).
+#' @param r   Risk-free rate per step (default 1/250).
+#' @param d   Dividend yield (default 0).
+#' @return A matrix of dimension npath x ntimestep of simulated asset prices.
+################################################################################
+genrfsamplestdNTSprices <- function(alpha, theta, beta, gamma,
+                                                    kappa, xi, lambda, zeta, 
+                                                    sigma0, S0, y0 = 0, 
+                                                    npath, ntimestep,
+                                                    dt = 1/250, r = 1/250, d = 0){
+  # 1) Generate stdNTS errors (constant beta, gamma)
+  error <- gensamplestdNTSerrors(alpha, theta, beta, gamma,
+                                                 npath, ntimestep, dt)
+  
+  # 2) Generate GARCH(1,1) sigma paths (uses your existing function)
+  sigma <- gensamplesigmapaths(error, kappa, xi, lambda, zeta, sigma0)
+  
+  # 3) Generate log-return paths
+  paths <- matrix(0, nrow = npath, ncol = ntimestep)
+  for (i in 1:nrow(paths)) {
+    paths[i, 1] <- y0
+    for (t in 2:ncol(paths)) {
+      w <- log(chf_stdNTS(u = -1i * sigma[i, t], 
+                          param = c(alpha, theta, beta, gamma)))
+      paths[i, t] <- r - d - w + sigma[i, t] * error[i, t]
+    }
+  }
+  
+  # 4) Convert log-returns to prices
+  paths <- t(apply(paths, 1, cumsum))
+  prices <- S0 * exp(paths)
+  prices <- Re(prices)  # remove any imaginary part
+  return(prices)
+}
+
+
+################################################################################
+#' @description Parallel version of constant-beta,gamma stdNTS price simulation.
+#' Mirrors the parallel approach in your code, but no B(t).
+#' @param alpha,theta,beta,gamma Same as above.
+#' @param ncores Number of cores for parallelization. Defaults to detectCores()-1.
+#' @inheritParams genrfsamplestdNTSprices
+#' @return A matrix of dimension npath x ntimestep of simulated asset prices.
+################################################################################
+genrfsamplestdNTSprices_parallel <- function(alpha, theta, 
+                                                             beta, gamma,
+                                                             kappa, xi, lambda, 
+                                                             zeta, sigma0, 
+                                                             S0 = 100, y0 = 0, 
+                                                             npath, ntimestep,
+                                                             dt = 1/250, 
+                                                             r = 1/250, d = 0,
+                                                             ncores = detectCores() - 1) {
+  library(parallel)
+  library(doParallel)
+  
+  # Set up parallel backend
+  cl <- makeCluster(ncores)
+  registerDoParallel(cl)
+  # 1) Generate stdNTS errors (constant beta, gamma)
+  error <- matrix(rnts(n = npath * ntimestep, ntsparam = c(alpha, theta, beta, gamma)), ncol = ntimestep, nrow = npath)
+  
+  # 2) Generate GARCH(1,1) sigma paths
+  sigma <- gensamplesigmapaths(error, kappa, xi, lambda, zeta, sigma0)
+  
+  # 3) Generate log-return paths in parallel
+  paths_list <- foreach(i = 1:nrow(error), 
+                        .combine = rbind, 
+                        .packages = c("temStaR")) %dopar% {
+    path <- numeric(ncol(error))
+    path[1] <- y0
+    for (t in 2:ncol(error)) {
+      w <- log(chf_stdNTS(u = -1i * sigma[i, t], 
+                          param = c(alpha, theta, beta, gamma)))
+      path[t] <- r - d - w + sigma[i, t] * error[i, t]
+    }
+    cumsum(path)
+  }
+  
+  stopCluster(cl)
+
+  # 4) Convert log-returns to prices
+  prices <- S0 * exp(paths_list)
+  prices <- Re(prices)
+  return(prices)
+}
+
+
+################################################################################
+#' @description Simple wrapper for computing option prices under stdNTS 
+#' with *constant* beta,gamma (plus GARCH(1,1) for volatility). It simulates 
+#' asset prices in parallel, then calls your existing `gensamplerfoptionprices()`.
+#' @param npath Number of simulation paths for asset price.
+#' @param alpha,theta,beta,gamma stdNTS parameters, with beta,gamma fixed.
+#' @param kappa,xi,lambda,zeta,sigma0 GARCH(1,1) parameters.
+#' @param S0 Initial asset price.
+#' @param y0 Initial log-return (default 0).
+#' @param pct_otm Vector of OTM percentages for calls/puts. E.g. c(0.1, 0.2).
+#' @param t  Maturity in years (e.g. 0.5 means 6-month).
+#' @param r  Risk-free rate per step (default 0.2/250).
+#' @param ncores Number of cores for parallelization.
+#' @return A length-2 numeric vector: the mean call and put prices across paths.
+################################################################################
+stdNTSoption <- function(npath,
+                                                  alpha, theta, 
+                                                  beta, gamma,
+                                                  kappa, xi, lambda, zeta, 
+                                                  sigma0, S0 = 100, y0 = 0,
+                                                  moneyness = 1.5, 
+                                                  tao = 30/250, 
+                                                  r = 0.2/250,
+                                                  ncores = detectCores() - 1) {
+  
+  # Convert continuous time in years to # of steps
+  ntimestep <- ceiling(tao * 250)
+  
+  # 1) Generate asset prices (constant beta,gamma) in parallel
+  sample_prices <- genrfsamplestdNTSprices_parallel(
+    alpha, theta, beta, gamma, 
+    kappa, xi, lambda, zeta, sigma0,
+    S0, y0, npath, ntimestep, dt = 1/250, r = r, ncores = ncores
+  )
+  
+  # 2) Compute option prices (calls & puts) with your existing function
+  option_prices <- gensamplerfoptionprices(
+    r = r, moneyness = moneyness,
+    sample_prices = sample_prices, type = 'European'
+  )
+  
+  # Combine call and put prices into a matrix
+  # Convert to values
+  result_df <- as.data.frame(option_prices) / S0
+  return(t(result_df))
+}
