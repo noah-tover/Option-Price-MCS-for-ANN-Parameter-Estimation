@@ -1,0 +1,190 @@
+library(randtoolbox)
+# First simulate halton vectors of parameters.
+simulateHaltonVectors <- function(n = 100000, sim_B = FALSE) {
+  n = n + 20 # Later removing the first 20 rows to make lower discrepancy from correlation.
+  if(sim_B == TRUE){
+    dim = 11
+  } else {
+    dim = 10
+  }
+  halton_points <- halton(n = n, dim = dim)
+  # 1. alpha: Uniform(0,1) -> (0, 2)
+  halton_points[, 1] <- 2 * halton_points[, 1]
+  
+  # 2. theta: Using an exponential decay with mean 1.2544.
+  #    qexp(u, rate = 1/mean) converts u ~ U(0,1) into an exponential variable.
+  halton_points[, 2] <- qexp(halton_points[, 2], rate = 1 / 1.2544)
+  
+  # 3. a_1: Uniform(-1, 1), but must not equal 0.
+  halton_points[, 3] <- 2 * halton_points[, 3] - 1
+  halton_points[, 3][halton_points[, 3] == 0] <- .Machine$double.eps  # adjust any exact 0 to a tiny value
+  
+  # 4. Moneyness ~ Uniform(.5, 1.5)
+  halton_points[,4] <- .5 * halton_points[,4] + .5
+  halton_points[,4][halton_points[,4] == 1] <- 1 + runif(1, min = -.5, max = .5) # if moneyness is exactly
+  
+  # 5. Tao ~ Uniform(.4, 1) 
+  halton_points[, 5] <- .6 * halton_points[, 5] + .4
+
+  # 6. kappa: Positive with no upper bound.
+  #    Again using an exponential transformation (mean = 1).
+  halton_points[, 6] <- qexp(halton_points[, 6], rate = 1)
+  
+  # 7. xi: Uniform(0,1)
+
+  # 8. zeta: Uniform(0,1) with the added constraint that zeta + xi < 1.
+  #    To ensure this, we let zeta = u * (1 - xi).
+  halton_points[, 8] <- halton_points[, 8] * (1 - xi)
+  
+  # 9. sigma_error: Uniform over [-0.05405997595, 0.05405997595] but not 0.
+  halton_points[, 9] <- 0.05405997595 * 2 * halton_points[, 9] - 0.05405997595
+  halton_points[, 9][halton_points[, 9] == 0] <- .Machine$double.eps  # adjust any exact 0
+  
+  # 10. Lambda ~ Uniform(0, 0.8)
+  halton_points[, 10] <- 0.8 * halton_points[, 10]
+  # 11. B ~ Uniform(-1, 1)
+  if(sim_B == TRUE){
+    halton_points[, 11] <- 2 * halton_points[, 11] - 1
+    halton_points[, 11][halton_points[, 11] == 0] <- .Machine$double.eps  # adjust any exact 0 to a tiny value
+    beta <- halton_points[, 11] * sqrt(2 * halton_points[,2] / (2 - halton_points[,1]))
+    gamma <- (1 - halton_points[,11] ^ 2)
+    halton_points <- cbind(halton_points, beta, gamma)
+  }
+
+  # Drop first 20 rows to avoid correlation problem.
+  halton_points <- halton_points[-(1:20),]
+  if(sim_B == TRUE){
+    colnames(halton_points) <- c("alpha", "theta", "a1", "moneyness", "tao", "kappa", "xi", "zeta", "sigma_error", "lambda", 'B', 'betas', 'gammas')
+  } else {
+    colnames(halton_points) <- c("alpha", "theta", "a1", "moneyness", "tao", "kappa", "xi", "zeta", "sigma_error", "lambda")
+  }
+  return(halton_points)
+}
+####################################################################################################################################################
+stoTntsoptionmontecarlo <- function(n_sim, 
+                                    chunk_size, 
+                                    output_dir = NULL, 
+                                    npath = NULL, 
+                                    nBpath = NULL, 
+                                    r = .02/250, 
+                                    ncores = parallel::detectCores() - 1, 
+                                    a0 = 0,
+                                    S0= 100,
+                                    y0 = 0,
+                                    sigma0 = 0.0096,
+                                    B0 = -0.2895){
+  # First generate n_sim halton vectors.
+  halton <- simulateHaltonVectors(n = n_sim, sim_B = FALSE)
+  print(paste("simulated", n_sim, "halton vectors", sep = " "))
+  # Next, loop through this list and simulate option prices for each parameter vector.
+  results_chunk <- list()
+  chunk_counter <- 1
+  print("Beginning Monte Carlo simulation...")
+  # Loop through each row (each simulation's parameter set)
+  for (i in 1:nrow(halton)) {
+    # Extract parameters from the halton vector row
+    params <- halton[i, ]
+    alpha_i      <- params["alpha"]
+    theta_i      <- params["theta"]
+    a1_i         <- params["a1"]
+    tao_i        <- params["tao"]      
+    kappa_i      <- params["kappa"]
+    xi_i         <- params["xi"]
+    zeta_i       <- params["zeta"]
+    sigma_error_i<- params["sigma_error"]
+    lambda_i     <- params["lambda"]
+    moneyness_i <- params["moneyness"]
+    option_matrix <- stoTntsoption(nBpath = nBpath, 
+                                   npath = npath, 
+                                   alpha = alpha_i, 
+                                   theta = theta_i, 
+                                   a0 = a0, 
+                                   a1 = a1_i, 
+                                   sigma_error = sigma_error_i, 
+                                   B0 = B0, 
+                                   kappa = kappa_i, 
+                                   xi = xi_i, 
+                                   lambda = lambda_i, 
+                                   zeta = zeta_i, 
+                                   sigma0 = sigma0, 
+                                   S0 = S0, 
+                                   y0 = y0, 
+                                   moneyness = moneyness_i, 
+                                   tao = tao_i, 
+                                   r = r, 
+                                   ncores = ncores)
+    mcs_row <- merge(t(params), option_matrix) # Only transposing because params is a subset.. theres a more elegant solution out there.
+    results_chunk <- append(results_chunk, mcs_row)
+    
+    chunk_counter <- 1 + chunk_counter
+    if(chunk_counter %% chunk_size == 0){
+      data <- do.call(rbind, results_chunk)
+      write.csv(data, paste(output_dir, "stoToptionpricemcs", i - chunk_counter, "_", i, ".csv", sep = ""))
+      results_chunk <- list() # empty list
+      chunk_counter <- 1
+      print("Downloaded chunk")
+    }
+    print("Monte Carlo simulation complete :D")
+  }
+}
+####################################################################################################################################################
+stdNTSoptionmontecarlo <- function(n_sim, 
+                                    chunk_size, 
+                                    output_dir = NULL, 
+                                    npath = NULL, 
+                                    r = .02/250, 
+                                    ncores = parallel::detectCores() - 1, 
+                                    S0= 100,
+                                    y0 = 0,
+                                    sigma0 = 0.0096){
+  # First generate n_sim halton vectors.
+  halton <- simulateHaltonVectors(n = n_sim, sim_B = TRUE)
+  print(paste("simulated", n_sim, "halton vectors", sep = " "))
+  # Next, loop through this list and simulate option prices for each parameter vector.
+  results_chunk <- list()
+  chunk_counter <- 1
+  print("Beginning Monte Carlo simulation...")
+  # Loop through each row (each simulation's parameter set)
+  for (i in 1:nrow(halton)) {
+    # Extract parameters from the halton vector row
+    params <- halton[i, ]
+    alpha_i      <- as.numeric(params["alpha"])
+    theta_i      <- as.numeric(params["theta"])
+    tao_i        <- params["tao"]      
+    kappa_i      <- params["kappa"]
+    xi_i         <- params["xi"]
+    zeta_i       <- params["zeta"]
+    lambda_i     <- params["lambda"]
+    moneyness_i <- params["moneyness"]
+    beta_i <- as.numeric(params["betas"])
+    gamma_i <- as.numeric(params["gammas"])
+    option_matrix <- stdNTSoption(npath = npath, 
+                                   alpha = alpha_i, 
+                                   theta = theta_i, 
+                                   kappa = kappa_i, 
+                                   xi = xi_i, 
+                                   lambda = lambda_i, 
+                                   zeta = zeta_i, 
+                                   sigma0 = sigma0, 
+                                   S0 = S0, 
+                                   y0 = y0, 
+                                   moneyness = moneyness_i, 
+                                   tao = tao_i, 
+                                   r = r, 
+                                   beta = beta_i,
+                                   gamma = gamma_i,
+                                   ncores = ncores)
+    
+    mcs_row <- merge(t(params), option_matrix)
+    results_chunk <- append(results_chunk, mcs_row)
+    chunk_counter <- 1 + chunk_counter
+    if(chunk_counter %% chunk_size == 0){
+      data <- do.call(rbind, results_chunk)
+      write.csv(data, paste(output_dir, "stdNTSoptionpricemcs", i - chunk_counter, "_", i, ".csv", sep = ""))
+      results_chunk <- list() # empty list
+      chunk_counter <- 1
+      print("Downloaded chunk")
+    }
+    print("Monte Carlo simulation complete :D")
+  }
+}
